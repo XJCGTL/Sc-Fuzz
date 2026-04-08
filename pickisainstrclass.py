@@ -111,7 +111,7 @@ def _merge_dynamic_isaclass_scores(fuzzerstate, filtered_weights: dict):
 # Do NOT @cache this function, as it is a random function.
 def _gen_next_isainstrclass_from_weights(weights: list = None) -> ISAInstrClass:
     positive_classes = [curr_key for curr_key, curr_val in weights.items() if curr_val > 0]
-    assert len(positive_classes), "Expected at least one ISA instruction class with strictly positive weight."
+    assert len(positive_classes), f"Expected at least one ISA instruction class with strictly positive filtered weight, got weights={weights}."
 
     epsilon = ISACLASS_EPSILON_EXPLORATION
     if random.random() < epsilon:
