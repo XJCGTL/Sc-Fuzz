@@ -172,7 +172,7 @@ def _pick_instr_with_exploration(keys_and_weights_dict, isaclass):
         # Keep the fuzzer alive even under overly restrictive dynamic/bug filters.
         fallback_instrs = [instrstr for instrstr, curr_weight in INSTRTYPE_INITIAL_RELATIVE_WEIGHTS[isaclass].items() if curr_weight > 0]
         if DO_ASSERT:
-            assert len(fallback_instrs), f"No instruction candidate available for ISA class {isaclass}; check INSTRTYPE_INITIAL_RELATIVE_WEIGHTS and design-specific zeroing/tolerance filters."
+            assert fallback_instrs, f"No instruction candidate available for ISA class {isaclass}; check INSTRTYPE_INITIAL_RELATIVE_WEIGHTS and design-specific zeroing/tolerance filters."
         return random.choice(fallback_instrs)
 
     if random.random() < INSTR_EPSILON_EXPLORATION:
