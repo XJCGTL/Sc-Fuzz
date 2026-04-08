@@ -44,16 +44,82 @@ ISAINSTRCLASS_INITIAL_BOOSTERS = {
     ISAInstrClass.SPECIAL:     0.0001
 }
 
+# Dynamic scoring knobs inspired by 评分Fuzz.md.
+# Keep defaults conservative so behavior remains close to the original static policy.
+ISACLASS_EPSILON_EXPLORATION = 0.08
+ISACLASS_MIN_POSITIVE_WEIGHT = 1e-9
+ISACLASS_BUG_WEIGHT = 0.55
+ISACLASS_COVERAGE_WEIGHT = 0.30
+ISACLASS_NOVELTY_WEIGHT = 0.15
+ISACLASS_SELECTION_DECAY = 0.05
+
 ###
 # Helper functions
 ###
+
+# Supports enum keys and string keys for compatibility with external feedback producers.
+def _feedback_value_for_key(feedback_map, key):
+    if not isinstance(feedback_map, dict):
+        return 0.0
+    candidates = [key]
+    if hasattr(key, "name"):
+        candidates.append(key.name)
+    candidates.append(str(key))
+    for cand in candidates:
+        if cand in feedback_map:
+            try:
+                return float(feedback_map[cand])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+def _normalize_weights(weights: dict):
+    total = sum(max(0.0, curr_val) for curr_val in weights.values())
+    if total <= 0:
+        return weights
+    inv_total = 1.0 / total
+    for curr_key in weights:
+        weights[curr_key] = max(0.0, weights[curr_key]) * inv_total
+    return weights
+
+def _merge_dynamic_isaclass_scores(fuzzerstate, filtered_weights: dict):
+    bug_scores = getattr(fuzzerstate, "isaclass_bug_scores", {})
+    coverage_scores = getattr(fuzzerstate, "isaclass_coverage_scores", {})
+    novelty_scores = getattr(fuzzerstate, "isaclass_novelty_scores", {})
+    selection_counts = getattr(fuzzerstate, "isaclass_selection_counts", {})
+
+    for curr_isaclass, curr_weight in filtered_weights.items():
+        if curr_weight <= 0:
+            continue
+
+        bug_score = max(0.0, _feedback_value_for_key(bug_scores, curr_isaclass))
+        coverage_score = max(0.0, _feedback_value_for_key(coverage_scores, curr_isaclass))
+        novelty_score = max(0.0, _feedback_value_for_key(novelty_scores, curr_isaclass))
+        pick_count = max(0.0, _feedback_value_for_key(selection_counts, curr_isaclass))
+
+        reward_multiplier = 1.0 + \
+            ISACLASS_BUG_WEIGHT * bug_score + \
+            ISACLASS_COVERAGE_WEIGHT * coverage_score + \
+            ISACLASS_NOVELTY_WEIGHT * novelty_score
+        decay = 1.0 / (1.0 + ISACLASS_SELECTION_DECAY * pick_count)
+        filtered_weights[curr_isaclass] = max(curr_weight * reward_multiplier * decay, ISACLASS_MIN_POSITIVE_WEIGHT)
+
+    return _normalize_weights(filtered_weights)
 
 # @param weights a list either None (equal weights) or as long as ISAInstrClass
 # return a ISAInstrClass
 # Do NOT @cache this function, as it is a random function.
 def _gen_next_isainstrclass_from_weights(weights: list = None) -> ISAInstrClass:
-    ret = random.choices(list(weights.keys()), weights=weights.values())[0]
-    assert weights[ret] != 0
+    positive_classes = [curr_key for curr_key, curr_val in weights.items() if curr_val > 0]
+    assert positive_classes, f"Expected at least one ISA instruction class with positive weight. Check isapickweights setup and filtering logic. Current weights={weights}."
+
+    epsilon = ISACLASS_EPSILON_EXPLORATION
+    if random.random() < epsilon:
+        ret = random.choice(positive_classes)
+    else:
+        ret = random.choices(positive_classes, weights=[weights[curr_key] for curr_key in positive_classes])[0]
+
+    assert weights[ret] > 0
     return ret
 
 # @brief For now, the weights used for choosing instructions are fixed over time.
@@ -176,5 +242,6 @@ def gen_next_isainstrclass(fuzzerstate) -> ISAInstrClass:
     filtered_weights = _get_isainstrclass_filtered_weights(fuzzerstate)
     _filter_regfsm_weight(fuzzerstate, filtered_weights)
     _filter_sensitive_instr_weights(fuzzerstate, filtered_weights)
+    _merge_dynamic_isaclass_scores(fuzzerstate, filtered_weights)
 
     return _gen_next_isainstrclass_from_weights(filtered_weights)

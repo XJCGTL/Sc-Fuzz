@@ -23,6 +23,13 @@ INSTRTYPE_INITIAL_RELATIVE_WEIGHTS = {
     curr_key: dict.fromkeys(curr_instrs, 1) for curr_key, curr_instrs in INSTRUCTIONS_BY_ISA_CLASS.items()
 }
 
+INSTR_EPSILON_EXPLORATION = 0.10
+INSTR_MIN_POSITIVE_WEIGHT = 1e-9
+INSTR_BUG_WEIGHT = 0.55
+INSTR_COVERAGE_WEIGHT = 0.30
+INSTR_NOVELTY_WEIGHT = 0.15
+INSTR_SELECTION_DECAY = 0.03
+
 # Useful for time to bug evaluation
 def forbid_vexriscv_ops(keys_and_weights_dict):
     keys_and_weights_dict_ret = copy(keys_and_weights_dict)
@@ -111,6 +118,68 @@ def forbid_vexriscv_ops(keys_and_weights_dict):
 
     return keys_and_weights_dict_ret
 
+def _feedback_value_for_instr(feedback_map, isaclass, instrstr):
+    if not isinstance(feedback_map, dict):
+        return 0.0
+
+    # 1) Flat map: {"add": ...}
+    if instrstr in feedback_map:
+        try:
+            return float(feedback_map[instrstr])
+        except (TypeError, ValueError):
+            return 0.0
+
+    # 2) Nested map: {ISAInstrClass.ALU: {"add": ...}} or {"ALU": {"add": ...}}
+    candidates = [isaclass]
+    if hasattr(isaclass, "name"):
+        candidates.append(isaclass.name)
+    candidates.append(str(isaclass))
+    for curr_key in candidates:
+        if curr_key in feedback_map and isinstance(feedback_map[curr_key], dict) and instrstr in feedback_map[curr_key]:
+            try:
+                return float(feedback_map[curr_key][instrstr])
+            except (TypeError, ValueError):
+                return 0.0
+
+    return 0.0
+
+def _apply_dynamic_instr_scores(keys_and_weights_dict, isaclass, fuzzerstate):
+    bug_scores = getattr(fuzzerstate, "instr_bug_scores", {})
+    coverage_scores = getattr(fuzzerstate, "instr_coverage_scores", {})
+    novelty_scores = getattr(fuzzerstate, "instr_novelty_scores", {})
+    selection_counts = getattr(fuzzerstate, "instr_selection_counts", {})
+
+    for instrstr in keys_and_weights_dict:
+        base_weight = keys_and_weights_dict[instrstr]
+        if base_weight <= 0:
+            continue
+
+        bug_score = max(0.0, _feedback_value_for_instr(bug_scores, isaclass, instrstr))
+        coverage_score = max(0.0, _feedback_value_for_instr(coverage_scores, isaclass, instrstr))
+        novelty_score = max(0.0, _feedback_value_for_instr(novelty_scores, isaclass, instrstr))
+        pick_count = max(0.0, _feedback_value_for_instr(selection_counts, isaclass, instrstr))
+
+        reward_multiplier = 1.0 + \
+            INSTR_BUG_WEIGHT * bug_score + \
+            INSTR_COVERAGE_WEIGHT * coverage_score + \
+            INSTR_NOVELTY_WEIGHT * novelty_score
+        decay = 1.0 / (1.0 + INSTR_SELECTION_DECAY * pick_count)
+        keys_and_weights_dict[instrstr] = max(base_weight * reward_multiplier * decay, INSTR_MIN_POSITIVE_WEIGHT)
+
+def _pick_instr_with_exploration(keys_and_weights_dict, isaclass):
+    positive_instrs = [instrstr for instrstr, curr_weight in keys_and_weights_dict.items() if curr_weight > 0]
+    if not positive_instrs:
+        # Keep the fuzzer alive even under overly restrictive dynamic/bug filters.
+        fallback_instrs = [instrstr for instrstr, curr_weight in INSTRTYPE_INITIAL_RELATIVE_WEIGHTS[isaclass].items() if curr_weight > 0]
+        if DO_ASSERT:
+            assert fallback_instrs, f"No instruction candidates with positive weight for ISA class {isaclass}. Verify INSTRTYPE_INITIAL_RELATIVE_WEIGHTS for this class and that design-specific filters keep at least one positive candidate."
+        return random.choice(fallback_instrs)
+
+    if random.random() < INSTR_EPSILON_EXPLORATION:
+        return random.choice(positive_instrs)
+
+    return random.choices(positive_instrs, weights=[keys_and_weights_dict[curr_key] for curr_key in positive_instrs])[0]
+
 ###
 # Exposed functions
 ###
@@ -156,7 +225,5 @@ def gen_next_instrstr_from_isaclass(isaclass: ISAInstrClass, fuzzerstate) -> str
         assert isaclass != ISAInstrClass.PPFSM    , "ISAInstrClass.PPFSM must be treated separately"
         assert isaclass != ISAInstrClass.EPCFSM   , "ISAInstrClass.EPCFSM must be treated separately"
 
-    ret = None
-    while ret is None or keys_and_weights_dict[ret] == 0:
-        ret = random.choices(list(keys_and_weights_dict.keys()), weights=keys_and_weights_dict.values())[0]
-    return ret
+    _apply_dynamic_instr_scores(keys_and_weights_dict, isaclass, fuzzerstate)
+    return _pick_instr_with_exploration(keys_and_weights_dict, isaclass)
